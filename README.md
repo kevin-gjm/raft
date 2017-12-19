@@ -5,4 +5,4 @@
 3. 然后誊写storeage.go文件，原因是独立性较高。实现Storage接口。并实例化一个MemoryStorage。是raft中存储原生log的。由于用到util.go中方法，誊写util.go.
     1. storage中entry的[0]条数据用来记录之前快照中最后的index和term.compact函数(压缩)会将压缩ID之前的所有数据丢弃，保证压缩ID < applied 是应用程序的责任
     2. 将storeage_test.go文件拷贝进去。进行测试 
-4. 之后应该是log.go中使用log_unstable.go /util.go
+4. 之后应该是log.go中使用log_unstable.go .不严谨的storage数据存储部分
