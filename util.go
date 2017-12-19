@@ -1,21 +1,19 @@
-
 package raft
 
 import (
-//	"bytes"
-//	"fmt"
+	//	"bytes"
+	//	"fmt"
 	pb "github.com/coreos/etcd/raft/raftpb"
 )
 
-
-func limitSize(ents []pb.Entry,maxSize uint64) []pb.Entry {
+func limitSize(ents []pb.Entry, maxSize uint64) []pb.Entry {
 	if len(ents) == 0 {
 		return ents
 	}
 	size := ents[0].Size()
 
 	var limit int
-	for limit =1;limit < len(ents);limit++ {
+	for limit = 1; limit < len(ents); limit++ {
 		size += ents[limit].Size()
 		if uint64(size) > maxSize {
 			break
