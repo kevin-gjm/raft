@@ -8,7 +8,7 @@ import (
 
 // id早于压缩的id
 var ErrCompacted = errors.New("requested index is unavailable due to compaction") 
-var ErrSnapOutOfData = errors.New("requested index is older than the existing snapshot")
+var ErrSnapOutOfDate = errors.New("requested index is older than the existing snapshot")
 var ErrUnavailable = errors.New("requested entry at index is unavailable")
 var ErrSnapshotTemporarilyUnavailable = errors.New("snapshot is temporarily unavailable")
 
