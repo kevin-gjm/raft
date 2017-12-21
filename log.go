@@ -2,12 +2,12 @@ package raft
 
 import (
 	"fmt"
-	"math"
+	//"math"
 
 	pb "github.com/coreos/etcd/raft/raftpb"
 )
 
-const noLimit = math.MaxUint64
+//const noLimit = math.MaxUint64
 
 type raftLog struct {
 	//存储所有log since the last snapshot
