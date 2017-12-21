@@ -6,3 +6,5 @@
     1. storage中entry的[0]条数据用来记录之前快照中最后的index和term.compact函数(压缩)会将压缩ID之前的所有数据丢弃，保证压缩ID < applied 是应用程序的责任
     2. 将storeage_test.go文件拷贝进去。进行测试 
 4. 之后应该是log.go中使用log_unstable.go .不严谨的storage数据存储部分
+    log.go 中使用storage与unstable两个存储，管理commited与applied两个index. 添加新的entries 到unstable中(管理其中发生的冲突)。compact会丢弃之前的数据。封装一些unstable和storage中的函数
+5. entry的管理誊写完成，之后应该是整个raft流程的誊写。首先誊写node.go节点。raft中最小的单位
