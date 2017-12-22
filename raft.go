@@ -185,3 +185,7 @@ type raft struct {
 	logger Logger
 }
 type stepFunc func(r *raft, m pb.Message)
+
+func stepLeader(r *raft,m pb.Message) {
+	switch 
+}
