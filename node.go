@@ -119,5 +119,5 @@ type Peer struct {
 }
 
 func StartNode(c *Config,peers []Peer) Node {
-	r: = newRaft(c)
+	r := newRaft(c)
 }
