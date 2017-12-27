@@ -13,19 +13,22 @@ type ReadState struct {
 type readIndexStatus struct {
 	req pb.Message
 	index uint64
+	//用于收集对端的回复消息，key为对端id: msg.from
 	acks map[uint64]struct{}
 }
 
 type readOnly struct {
 	option ReadOnlyOption
+	//msg中第一条log的data，作为key
 	pendingReadIndex map[string]*readIndexStatus
+	//也是用上面的那个string作为唯一标识的
 	readIndexQueue []string
 }
 
 func newReadOnly(option ReadOnlyOption) *readOnly {
 	return & readOnly {
 		option: option,
-		pendingReadIndex :make(map[string]*readIndexStatus)
+		pendingReadIndex :make(map[string]*readIndexStatus),
 	}
 }
 
@@ -40,7 +43,7 @@ func (ro *readOnly) addRequest(index uint64, m pb.Message) {
 	ro.pendingReadIndex[ctx] = &readIndexStatus{index:index,req:m,acks:make(map[uint64]struct{})}
 	ro.readIndexQueue= append(ro.readIndexQueue,ctx)
 }
-
+//用于收集对端的回复消息，并返回收集到的总个数。通过msg中的context进行关联
 func (ro *readOnly) recvAck(m pb.Message) int {
 	rs,ok := ro.pendingReadIndex[string(m.Context)]
 	if !ok {
@@ -50,6 +53,7 @@ func (ro *readOnly) recvAck(m pb.Message) int {
 	return len(rs.acks) + 1
 }
 
+//删掉readonly的queue中包含m消息在内之前的内容。并清除相应的pendingReadIndex。返回所有清除的readIndexStatus
 func (ro *readOnly) advance(m pb.Message) []*readIndexStatus {
 	var (
 		i int

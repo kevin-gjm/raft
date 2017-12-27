@@ -321,9 +321,9 @@ func (r *raft) send(m pb.Message) {
 	r.msgs = append(r.msgs,m)
 }
 
-func (r *raft) sendHeartbeat(to uint64,ctx []byte) {
-	、、m:=
-}
+
+
+
 
 func (r *raft) getProgress(id uint64 ) *Progress {
 	if pr,ok := r.prs[id]; ok {
@@ -394,6 +394,140 @@ func (r *raft) sendAppend(to uint64) {
 	r.send(m)
 }
 
+func (r *raft) sendHeartbeat(to uint64,ctx []byte) {
+	//跟随者也许跟领导者不同步，或者不含有所有的提交日志，领导者必须不能发送commit将跟随者的commit向前推进
+	commit := min(r.getProgress(to).Match,r.raftLog.committed)
+
+	m:= pb.Message{
+		To:	to,
+		Type: pb.MsgHeartbeat,
+		Commit:commit,
+		Context:ctx,
+	}
+	r.send(m)
+}
+
+//raft的每一个peer都自信参数中的函数
+func (r *raft)forEachProgress(f func(id uint64,pr *Progress)) {
+	for id,pr := range r.prs {
+		f(id,pr)
+	}
+
+	for id,pr := range r.learnerPrs {
+		f(id,pr)
+	}
+}
+
+func (r *raft)bcastAppend() {
+	r.forEachProgress( func(id uint64, _ *Progress){
+		if id == r.id {
+			return 
+		}
+		r.sendAppend(id)
+	})
+}
+//根据对端progress决定添加多少log entry，并发送到对端
+func(r *raft) bcastHeartbeat() {
+	lastCtx := r.readOnly.lastPendingRequestCtx()
+	if len(lastCtx) == 0 {
+		r.bcastHeartbeatWithCtx(nil)
+	}else{
+		r.bcastHeartbeatWithCtx([]byte(lastCtx))
+	}
+}
+
+func (r *raft) bcastHeartbeatWithCtx(ctx []byte) {
+	r.forEachProgress(func(id uint64,_ *Progress){
+		if id == r.id {
+			return 
+		}
+		r.sendHeartbeat(id,ctx)
+	})
+}
+//试图推进commit index。成功返回true
+//获取所有的progress的commit match，然后排序。获取多数人位置处的提交index.此位置即为新的committed  index
+func (r *raft) maybeCommit() bool {
+	mis := make(uint64Slice,0,len(r.prs))
+	for _,p := range r.prs {
+		mis = append(mis,p.Match)
+	}
+	sort.Sort(sort.Reverse(mis))
+	//多数的提交index
+	mci := mis[r.quorum() -1]
+	return r.raftLog.maybeCommit(mci,r.Term)
+}
+func (r *raft) reset(term uint64) {
+	if r.Term != term {
+		r.Term = term
+		r.Vote = None
+	}
+	r.lead = None
+
+	r.electionElapsed = 0
+	r.heartbeatElapsed = 0
+	r.resetRandomizedElectionTimeout()
+
+	r.abortLeaderTransfer()
+
+	r.votes = make(map[uint64]bool)
+	r.forEachProgress(func(id uint64,pr *Progress) {
+		*pr = Progress{Next:r.raftLog.lastIndex() +1, ins:newInflights(r.maxInflight),IsLearner:pr.IsLearner}
+		if id == r.id {
+			pr.Match = r.raftLog.lastIndex()
+		}
+	})
+
+	r.pendingConf = false
+	r.readOnly = newReadOnly(r.readOnly.option)
+}
+
+func (r *raft) appendEntry(es ...pb.Entry) {
+	li := r.raftLog.lastIndex()
+	for i:= range es {
+		es[i].Term = r.Term
+		es[i].Index = li + 1 +uint64(i)
+	}
+
+	r.raftLog.append(es...)
+	r.getProgress(r.id).maybeUpdate(r.raftLog.lastIndex())
+	r.maybeCommit()
+}
+
+//非领导者选举超时后，执行此函数.每一个tick执行一次，计数处理判断超时
+func(r *raft)tickElection() {
+	r.electionElapsed++
+	if r.promotable() && r.pastElectionTimeout() {
+		r.electionElapsed = 0
+		r.Step(pb.Message{From:r.id,Type:pb.MsgHup})
+	}
+}
+
+func (r *raft) tickHeartbeat() {
+	r.heartbeatElapsed++
+	r.electionElapsed++ 
+	
+	if r.electionElapsed >= r.electionTimeout {
+		r.electionElapsed = 0 
+		if r.checkQuorum {
+			r.Step(pb.Message{From:r.id,Type:pb.MsgCheckQuorum})
+		}
+		if r.state == StateLeader && r.leadTransferee != None {
+			r.abortLeaderTransfer()
+		}
+	}
+	if r.state != StateLeader {
+		return 
+	} 
+
+	if r.heartbeatElapsed >= r.heartbeatTimeout {
+		r.heartbeatElapsed = 0
+		r.Step(pb.Message{From:r.id,Type:pb.MsgBeat})
+	}
+}
+
+func (r *raft) Step(m pb.Message) error {
+	
+}
 type stepFunc func(r *raft, m pb.Message)
 
 // 领导者对消息的处理过程
@@ -450,4 +584,23 @@ func stepFollower(r *raft, m pb.Message) {
 	case pb.MsgReadIndex:
 	case pb.MsgReadIndexResp:
 	}
+}
+
+
+
+func (r *raft) promotable() bool {
+	_,ok := r.prs[r.id]
+	return ok
+}
+//若r.electionElapsed比election timeout >= 返回true 
+func (r *raft) pastElectionTimeout() bool {
+	return r.electionElapsed >= r.randomizedElectionTimeout
+}
+
+func (r *raft) resetRandomizedElectionTimeout() {
+	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
+}
+
+func (r *raft) abortLeaderTransfer() {
+	r.leadTransferee = None
 }
