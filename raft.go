@@ -188,7 +188,7 @@ type raft struct {
 }
 
 func newRaft(c *Config) *raft {
-	if err := c.validate;err != nil {
+	if err := c.validate();err != nil {
 		panic(err.Error())
 	}
 	raftlog := newLog(c.Storage,c.Logger)
@@ -215,11 +215,11 @@ func newRaft(c *Config) *raft {
 		id:					c.ID,
 		lead:				None,
 		isLearner:			false,
-		raftLog:			raftLog,
+		raftLog:			raftlog,
 		maxMsgSize:			c.MaxSizePerMsg,
 		maxInflight:		c.MaxInflightMsgs,
 		prs:				make(map[uint64]*Progress),
-		learnersPrs:		make(map[uint64]*Progress),
+		learnerPrs:			make(map[uint64]*Progress),
 		electionTimeout:	c.ElectionTick,
 		heartbeatTimeout:	c.HeartbeatTick,
 		logger:				c.Logger,
@@ -231,25 +231,25 @@ func newRaft(c *Config) *raft {
 
 	//将集群中的信息扔到Progress中
 	for _,p :=range peers {
-		r.prs[p] = &Progress{Next:1,ins:newInflight(r.maxInflight)}
+		r.prs[p] = &Progress{Next:1,ins:newInflights(r.maxInflight)}
 	}
 	for _,p :=range learners {
 		if _,ok := r.prs[p];ok {
 			panic(fmt.Sprintf("node %x is in both learn and peer list",p))
 		}
-		r.learnerPrs[p] = &Progress{Next:1,ins:newInflight(r.maxInflight),IsLearner:true}
+		r.learnerPrs[p] = &Progress{Next:1,ins:newInflights(r.maxInflight),IsLearner:true}
 		if r.id == p {
 			r.isLearner = true
 		}
 	}
 
 	//载入hardState
-	if ! isHardStateEqual(hs,emptyState) {
+	if !isHardStateEqual(hs,emptyState) {
 		r.loadState(hs)
 	}
 	//读取日志中的相关信息
 	if c.Applied >0 {
-		raftLog.appliedTo(c.Applied)
+		raftlog.appliedTo(c.Applied)
 	}
 	
 	r.becomeFollower(r.Term,None)
@@ -525,8 +525,214 @@ func (r *raft) tickHeartbeat() {
 	}
 }
 
+func(r *raft) becomeFollower(term uint64,lead uint64) {
+	r.step = stepFollower
+	r.reset(term)
+	r.tick=r.tickElection
+	r.lead = lead
+	r.state = StateFollower
+	r.logger.Infof("%x became follower at term %x",r.id,r.Term)
+}
+
+func(r *raft) becomeCandidate() {
+	if r.state == StateLeader {
+		panic("invalid transition [leader -> candidate]")
+	}
+	r.step = stepCandidate
+	r.reset(r.Term+1)
+	r.tick = r.tickElection
+	r.Vote = r.id
+	r.state = StateCandidate
+	r.logger.Infof("%x become candidate at term %d",r.id,r.Term)
+}
+
+func (r *raft) becomePreCandidate() {
+	if r.state == StateLeader {
+		panic("invalid transition [leader -> pre-candidate]")
+	}
+	r.step = stepCandidate
+	r.votes = make(map[uint64]bool)
+	r.tick = r.tickElection
+	r.state = StatePreCandidate
+	r.logger.Infof("%x become pre_candidate at term %d",r.id,r.Term)
+}
+
+func (r *raft) becomeLeader() {
+	if r.state == StateFollower {
+		panic("invalid transition [follower -> leader]")
+	}
+	r.step = stepLeader
+	r.reset(r.Term)
+	r.tick = r.tickHeartbeat
+	r.lead = r.id
+	r.state = StateLeader
+
+	ents,err := r.raftLog.entries(r.raftLog.committed+1,noLimit)
+	if err != nil {
+		r.logger.Panicf("unexpected error getting uncommitted entries (%v)",err)
+	}
+	nconf := numOfPendingConf(ents)
+	if nconf > 1 {
+		panic("unexpected multiple uncommitted config entry")
+	}
+	if nconf == 1 {
+		r.pendingConf = true
+	}
+	r.appendEntry(pb.Entry{Data:nil})
+	r.logger.Infof("%x become leader at term %d",r.id,r.Term)
+}
+
+func(r *raft) campaign(t CampaignType) {
+	var term uint64
+	var voteMsg pb.MessageType
+
+	if t == campaignPreElection {
+		r.becomePreCandidate()
+		voteMsg = pb.MsgPreVote
+		//preVote rpc send for the next term
+		term = r.Term + 1
+	} else {
+		r.becomeCandidate()
+		voteMsg = pb.MsgVote
+		term = r.Term
+	}
+
+	if r.quorum() == r.poll(r.id,voteRespMsgType(voteMsg),true) {
+		//参加选举成功，进入下一个状态
+		if t == campaignPreElection {
+			r.campaign(campaignElection)
+		}else{
+			r.becomeLeader()
+		}
+		return
+	}
+
+	for id := range r.prs {
+		if id == r.id {
+			continue
+		}
+		r.logger.Infof("%x [logterm: %d,index: %d] sent %s request to %x at term %d",
+			r.id,r.raftLog.lastTerm(),r.raftLog.lastIndex(),voteMsg,id,r.Term)
+		var ctx []byte
+		if t == campaignTransfer {
+			ctx = []byte(t)
+		}
+		r.send(pb.Message{Term:term,To:id,Type:voteMsg,Index:r.raftLog.lastIndex(),LogTerm:r.raftLog.lastTerm(),Context:ctx})
+	}
+}
+
+func (r *raft) poll( id uint64,t pb.MessageType,v bool) (granted int) {
+	if v {
+		r.logger.Infof("%x received %s from %x at term %d",r.id,t,id,r.Term)
+	}else {
+		r.logger.Infof("%x received %s rejection from %x at term %d",r.id,t,id,r.Term)
+	}
+	if _,ok := r.votes[id]; !ok {
+		r.votes[id] = v
+	}
+
+	for _,vv :=range r.votes {
+		if vv {
+			granted++
+		}
+	}
+	return granted
+}
+
 func (r *raft) Step(m pb.Message) error {
-	
+	switch {
+	case m.Term==0:
+		//local message
+	case m.Term > r.Term:
+		if m.Type == pb.MsgVote || m.Type == pb.MsgPreVote {
+			force := bytes.Equal(m.Context,[]byte(campaignTransfer))
+			inLease := r.checkQuorum && r.lead != None && r.electionElapsed<r.electionTimeout
+
+			if !force && inLease {
+				//若在最小的选举时间内收到vote的请求。忽略请求
+				r.logger.Infof("%x [logterm: %d, index: %d, vote: %x] ignored %s from %x [logterm: %d, index: %d] at term %d: lease is not expired (remaining ticks: %d)",
+				r.id, r.raftLog.lastTerm(), r.raftLog.lastIndex(), r.Vote, m.Type, m.From, m.LogTerm, m.Index, r.Term, r.electionTimeout-r.electionElapsed)
+			}
+		}
+		switch {
+		case m.Type == pb.MsgPreVote:
+			//不更改term
+		case m.Type == pb.MsgPreVoteResp && !m.Reject :
+			//当pre-vote被大多数确认后，我们将更改我们的term.若非如此term是拒绝我们的，下一个term变成跟随者
+		default:
+			//收到更大的term，身份变更为跟随者
+			r.logger.Infof("%x [term: %d] received a %s message with higher term from %x [term： %d]",
+				r.id,r.Term,m.Type,m.From,m.Term)
+				if m.Type == pb.MsgApp || m.Type == pb.MsgHeartbeat || m.Type == pb.MsgSnap {
+					r.becomeFollower(m.Term,m.From)
+				}else {
+					r.becomeFollower(m.Term,None)
+				}		
+		}
+	case m.Term < r.Term:
+		if r.checkQuorum && (m.Type == pb.MsgHeartbeat || m.Type == pb.MsgApp) {
+			//我们收到一个leader发来的lower term信息，这有可能是网络延时造成的，也可能是此节点在之前网络分隔的情况下推进了term
+			r.send(pb.Message{To: m.From,Type:pb.MsgAppResp}) //忽略信息内容，将此本节点的term返回给他
+		}else {
+			//忽略其他信息
+			r.logger.Infof("%x [term: %d] ignore a %s msg with lower term from %x [term: %d]",
+				r.id,r.Term,m.From,m.Term)
+		}
+		return nil
+	}
+
+
+	switch m.Type {
+	case pb.MsgHup://自己要参加选举
+		if r.state != StateLeader {
+			ents,err := r.raftLog.slice(r.raftLog.applied+1,r.raftLog.committed+1,noLimit)
+			if err != nil {
+				r.logger.Panicf("unexpected error getting unapplied entries (%v)",err)
+			}
+			if n:=numOfPendingConf(ents);n!= 0 && r.raftLog.committed > r.raftLog.applied {
+				//有n个配置更改日志，不允许参加选举
+				r.logger.Warningf("%x cannot campaign at term %d since there are still % pending configure changes to apply",r.id,r.Term,n)
+				return nil
+			}
+
+			r.logger.Infof("%x is starting a new election at term %d",r.id,r.Term)
+			if r.preVote {
+				r.campaign(campaignPreElection)
+			}else{
+				r.campaign(campaignElection)
+			}
+		}else {
+			r.logger.Infof("%x ignore MsgHup because alread leader",r.id)
+		}
+	case pb.MsgVote,pb.MsgPreVote:
+		if r.isLearner {
+			//忽略
+			r.logger.Infof("%x [logterm: %d,index: %d, vote: %x] ignore %s from %x [logterm: %d,index: %d] at term %d;learner can not vote",
+				r.id,r.raftLog.lastTerm(),r.raftLog.lastIndex(),r.Vote,m.Type,m.From,m.LogTerm,m.Index,r.Term)
+			return nil
+		}
+		// m.term > r.Term prevote时产生。对msgvote m.term==r.term总是相等
+		//isUpToDate 给定的index和term比log中所有内容都新
+		if (r.Vote== None || m.Term > r.Term||r.Vote == m.From) && r.raftLog.isUpToDate(m.Index,m.LogTerm) {
+			//投票
+			r.logger.Infof("%x [logterm: %d,index: %d,vote: %x] cast %s for %x [logterm: %d,index: %d] at term %d",
+				r.id,r.raftLog.lastTerm(),r.raftLog.lastIndex(),r.Vote,m.Type,m.From,m.Term,m.Index,r.Term)
+			//使用收到消息中的term进行回复(非本地的term)
+			r.send(pb.Message{To:m.From,Term:m.Term,Type:voteRespMsgType(m.Type)})
+			if m.Type == pb.MsgVote {
+				r.electionElapsed = 0
+				r.Vote = m.From
+			}
+		}else {
+			//拒绝投票
+			r.logger.Infof("%x [logterm: %d,index: %d,vote: %x] reject %s from %x [logterm: %d,index:%d] at term %d",
+				r.id,r.raftLog.lastTerm(),r.raftLog.lastIndex(),r.Vote,m.Type,m.From,m.Term,m.Index,r.Term)
+			r.send(pb.Message{To:m.From,Term:r.Term,Type:voteRespMsgType(m.Type),Reject:true})
+		}
+	default:
+		r.step(r,m)
+	}
+	return nil
 }
 type stepFunc func(r *raft, m pb.Message)
 
@@ -534,8 +740,38 @@ type stepFunc func(r *raft, m pb.Message)
 func stepLeader(r *raft,m pb.Message) {
 	switch m.Type {
 	case pb.MsgBeat:
+		r.bcastHeartbeat()
+		return
 	case pb.MsgCheckQuorum:
+		//支持者中大多数都挂了，肯定不能继续当领导者了
+		if !r.checkQuorumActive() {
+			r.logger.Warningf("%x stepped down to follower since quorum is not active",r.id)
+			r.becomeFollower(r.Term,None)
+		}
 	case pb.MsgProp:
+		if len(m.Entries) == 0 {
+			r.logger.Panicf("%x stepped empty MsgProp",r.id)
+		}
+		if _,ok := r.prs[r.id];!ok {
+			//若我们不是range中的一个(如：作为领导时将自己移除)
+			return 
+		}
+		if r.leadTransferee != None {
+			r.logger.Debugf("%x [term %d] transfer leadership to %x is in progress;droping proposal",r.id,r.Term,r.leadTransferee)
+			return 
+		}
+		for i,e := range m.Entries {
+			if e.Type == pb.EntryConfChange {
+				if r.pendingConf {
+					r.logger.Infof("propose conf %s ignored since pending unapplied configuration",e.String())
+					m.Entries[i] = pb.Entry{Type:pb.EntryNormal}
+				}
+				r.pendingConf = true
+			}
+		}
+		r.appendEntry(m.Entries...)
+		r.bcastAppend()
+		return
 	case pb.MsgReadIndex:
 	}
 
@@ -578,8 +814,8 @@ func stepFollower(r *raft, m pb.Message) {
 	case pb.MsgProp:
 	case pb.MsgApp:
 	case pb.MsgHeartbeat:
-	case MsgSnap:
-	case MsgTransferLeader:
+	case pb.MsgSnap:
+	case pb.MsgTransferLeader:
 	case pb.MsgTimeoutNow:
 	case pb.MsgReadIndex:
 	case pb.MsgReadIndexResp:
@@ -592,6 +828,14 @@ func (r *raft) promotable() bool {
 	_,ok := r.prs[r.id]
 	return ok
 }
+func (r *raft) loadState(state pb.HardState) {
+	if state.Commit < r.raftLog.committed || state.Commit > r.raftLog.lastIndex() {
+		r.logger.Panicf("%x state.commit %d is out of range [%d,%d]",r.id,state.Commit,r.raftLog.committed,r.raftLog.lastIndex())
+	}
+	r.raftLog.committed = state.Commit
+	r.Term = state.Term
+	r.Vote = state.Vote
+}
 //若r.electionElapsed比election timeout >= 返回true 
 func (r *raft) pastElectionTimeout() bool {
 	return r.electionElapsed >= r.randomizedElectionTimeout
@@ -601,6 +845,33 @@ func (r *raft) resetRandomizedElectionTimeout() {
 	r.randomizedElectionTimeout = r.electionTimeout + globalRand.Intn(r.electionTimeout)
 }
 
+//当前raft状态机中包含本机在内的所有机器progress中recentactive状态的和 >= 大多数 -->return true
+//此函数还会把所有的recentactive设置为false
+func (r *raft) checkQuorumActive() bool {
+	var act int
+
+	r.forEachProgress(func(id uint64,pr *Progress){
+		if id == r.id {
+			act++
+		}
+		if pr.RecentActive && !pr.IsLearner {
+			act++
+		}
+		pr.RecentActive = false
+	})
+	return act >= r.quorum()
+}
+
 func (r *raft) abortLeaderTransfer() {
 	r.leadTransferee = None
+}
+
+func numOfPendingConf(ents []pb.Entry) int {
+	n:=0
+	for i:= range ents {
+		if ents[i].Type == pb.EntryConfChange {
+			n++
+		}
+	}
+	return n
 }
