@@ -773,6 +773,28 @@ func stepLeader(r *raft,m pb.Message) {
 		r.bcastAppend()
 		return
 	case pb.MsgReadIndex:
+		if r.quorum() > 1 {
+			if r.raftLog.zeroTermOnErrCompacted(r.raftLog.term(r.raftLog.committed)) != r.Term {
+			//拒绝此次请求此领导者在此term内有未提交的log
+			return 
+			}
+
+			switch r.readOnly.option {
+			case ReadOnlySafe:
+				r.readOnly.addRequest(r.raftLog.committed,m)
+				r.bcastHeartbeatWithCtx(m.Entries[0].Data)
+			case ReadOnlyLeaseBased:
+				ri := r.raftLog.committed
+				if m.From == None || m.From == r.id {
+				//来自local member
+					r.readStates = append(r.readStates, ReadState{Index: r.raftLog.committed, RequestCtx: m.Entries[0].Data})
+				}else {
+					r.send(pb.Message{To: m.From,Type:pb.MsgReadIndexResp,Index:ri,Entries:m.Entries})
+				}
+			}
+		}else {
+		r.readStates = append(r.readStates,ReadState{Index: r.raftLog.committed, RequestCtx: m.Entries[0].Data})
+		}
 	}
 
 	//所有其他的消息类型需要一个progress来进行
@@ -783,10 +805,131 @@ func stepLeader(r *raft,m pb.Message) {
 
 	switch m.Type {
 	case pb.MsgAppResp:
+		pr.RecentActive = true
+
+		if m.Reject {
+			r.logger.Debugf("%x received msgApp rejection(lastindex: %d) from %x from index %d",
+				r.id,m.RejectHint,m.From,m.Index)
+			if pr.maybeDecrTo(m.Index,m.RejectHint) {
+				//重新设置完成peer的progress
+				r.logger.Debugf("%x decreased progress of %x to [%s]",r.id,m.From,pr)
+				if pr.State == ProgressStateReplicate {
+					pr.becomeProbe()
+				}
+				r.sendAppend(m.From)
+			}
+		}else {
+			odlPaused := pr.IsPaused()
+			if pr.maybeUpdate(m.Index) {
+				//对端处理消息成功更新pr的状态并更新pr中的inflights
+				switch{
+				case pr.State == ProgressStateProbe:
+					pr.becomeReplicate()
+				case pr.State == ProgressStateSnapshot && pr.needSnapshotAbort() :
+					r.logger.Debugf("%x snapshot aborted, resumed sending replication message to %x [%s]",r.id,m.From,pr)
+					pr.becomeProbe()
+				case pr.State == ProgressStateReplicate:
+					pr.ins.freeTo(m.Index)
+				}
+
+				if r.maybeCommit() {
+					r.bcastAppend()
+				}else if odlPaused {
+					//snapshot中暂停处理。此处为一个恢复点，另一个是heartbeatresp
+					r.sendAppend(m.From)
+				}
+				if m.From == r.leadTransferee && pr.Match == r.raftLog.lastIndex() {
+					r.logger.Infof("%x sent MsgTimeoutNow to %x after received MsgAppResp",r.id,m.From)
+					r.sendTimeoutNow(m.From)
+				}
+			}
+		}
 	case pb.MsgHeartbeatResp:
+		pr.RecentActive = true
+		pr.resume()
+
+		//从满的inflights中释放一个位置，允许进行progress
+		if pr.State == ProgressStateReplicate && pr.ins.full() {
+			pr.ins.freeFirstOne()
+		}
+		if pr.Match < r.raftLog.lastIndex() {
+			r.sendAppend(m.From)
+		}
+
+		if r.readOnly.option != ReadOnlySafe || len(m.Context) == 0 {
+			return
+		}
+		ackCount := r.readOnly.recvAck(m)
+		if ackCount < r.quorum() {
+			return
+		}
+
+		//返回以m为ctx的所有的readindex
+		rss := r.readOnly.advance(m)
+
+		for _,rs := range rss {
+			req := rs.req  //相应的消息
+			if req.From == None || req.From == r.id {
+				//添加到readStates 留待处理
+				r.readStates = append(r.readStates,ReadState{Index:rs.index,RequestCtx:req.Entries[0].Data})
+			}else {
+				//其他节点将readindex相关的信息发送给对端
+				r.send(pb.Message{To:req.From,Type:pb.MsgReadIndexResp,Index:rs.index,Entries:req.Entries})
+			}
+		}
+
 	case pb.MsgSnapStatus:
+		if pr.State != ProgressStateSnapshot{
+			return
+		}
+		if !m.Reject {
+			pr.becomeProbe()
+			r.logger.Debugf("%x snapshot succeeded,resumed send replication message to %x [%s]",r.id,m.From,pr)
+		}else {
+			pr.snapshotFailure()
+			pr.becomeProbe()
+			r.logger.Debugf("%x snapshot failed,resumed sending replication message to %x [%s]",r.id,m.From,pr)
+		}
+		//若snapshot失败，等待下一个heartbeat
+		//snapshot完成，等待下一个msgApp
+		pr.pause()
 	case pb.MsgUnreachable:
+		//正常的过程中，若unreachable，肯达可能是a MsgApp is lost
+		if pr.State == ProgressStateReplicate {
+			pr.becomeProbe()
+		}
+		r.logger.Debugf("%x failed to send message to %x because it is unreachable [%s]",r.id,m.From,pr)
 	case pb.MsgTransferLeader:
+		if pr.IsLearner {
+			r.logger.Debugf("%x is learner. Ignore transferring leadership",r.id)
+			return 
+		}
+		leadTransferee := m.From
+		lastLeadTransferee := r.leadTransferee 
+		if lastLeadTransferee != None {
+			if lastLeadTransferee == leadTransferee {
+				r.logger.Infof("%x [term %d] transfer leadership to %x is in progress,ignore request to same node %x",
+					r.id,r.Term,leadTransferee,leadTransferee)
+				return
+			}
+			r.abortLeaderTransfer()
+			r.logger.Infof("%x [term %d] abort previous transferring leadership to %x",r.id,r.Term,lastLeadTransferee)
+		}
+		if leadTransferee == r.id {
+			r.logger.Debugf("%x is already leader. Ignore transferring leadership to self",r.id)
+			return
+		}
+		r.logger.Infof("%x [term %d] starts to transfer leadership to %x", r.id, r.Term, leadTransferee)
+		//领带更迭需要在一个选举周期中完成，因此重置 r.electionElapsed.
+		r.electionElapsed =0
+		r.leadTransferee = leadTransferee
+
+		if pr.Match == r.raftLog.lastIndex() {
+			r.sendTimeoutNow(leadTransferee)
+			r.logger.Infof("%x sends MsgTimeoutNow to %x immediately as %x already has up-to-date log",r.id,leadTransferee,leadTransferee)
+		}else {
+			r.sendAppend(leadTransferee)
+		}
 	}
 }
 
@@ -860,6 +1003,9 @@ func (r *raft) checkQuorumActive() bool {
 		pr.RecentActive = false
 	})
 	return act >= r.quorum()
+}
+func(r *raft) sendTimeoutNow(to uint64) {
+	r.send(pb.Message{To:to,Type:pb.MsgTimeoutNow})
 }
 
 func (r *raft) abortLeaderTransfer() {
